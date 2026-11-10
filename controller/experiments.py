@@ -37,6 +37,8 @@ PROMO_WINDOW_DAYS = 4
 DECAY_WINDOW_DAYS = 2
 MAX_SEG_RULES_PER_DIM = 3
 SUPERVISOR_PENALTY = 10
+SOFT_STOP_Z, SOFT_STOP_LIFT = -1.645, 0.05   # stop *exploring* an arm trending >5% worse
+MAX_EXPLORE_DAYS = 6
 
 
 def init_state(w, config: dict) -> dict:
@@ -107,6 +109,8 @@ def look(w, st: dict, today: int, minute: int, decay_only: bool = False) -> list
     hyp = []  # (family, dim, arm, seg, cmp)
     for d in DIMS:
         s = st[d]
+        if s["active"]:
+            s.setdefault("explore_since", minute)
         ctl_i = w.oi[d][s["control"]]
         ruled = {(seg_key(r["seg"]), r["arm"]) for r in s["rules"]}
         harmed = {(seg_key(h["seg"]), h["arm"]) for h in s["harm"]}
@@ -152,14 +156,25 @@ def look(w, st: dict, today: int, minute: int, decay_only: bool = False) -> list
                     continue
                 if c.n_arm >= MIN_N and c.n_ctl >= MIN_N:
                     hyp.append(("ALL" if not seg else "SEG", d, arm, seg, c))
-                if not seg and c.n_arm >= FUTILITY_N and c.ci(1.96)[1] < 1 + MIN_LIFT and arm in s["active"] \
-                        and not any(r["arm"] == arm for r in s["rules"]):
+                exploring = not seg and arm in s["active"] and not any(r["arm"] == arm for r in s["rules"])
+                why = None
+                if exploring and c.n_arm >= FUTILITY_N and c.ci(1.96)[1] < 1 + MIN_LIFT:
+                    why = f"{c.n_arm} calls, 95% CI upper {c.ci(1.96)[1] - 1:+.1%} < +{MIN_LIFT:.0%}"
+                elif exploring and cr is not None and cr.z <= SOFT_STOP_Z and cr.rr < 1 - SOFT_STOP_LIFT \
+                        and cr.n_arm >= HARM_MIN_N:
+                    # Stopping exploration is cheap to get wrong (we only lose information), so an arm
+                    # that is merely *trending* worse recently is stopped on much weaker evidence than
+                    # a harm verdict. This is what catches an explored arm that decays.
+                    c = cr
+                    why = f"trending worse over the last {DECAY_WINDOW_DAYS}d ({cr.rr - 1:+.1%}, z={cr.z:.2f})"
+                elif exploring and minute - s.get("explore_since", minute) >= MAX_EXPLORE_DAYS * 1440 \
+                        and c.p_better > 0.2:
+                    why = f"no sign of a win after {MAX_EXPLORE_DAYS} days ({c.rr - 1:+.1%}, z={c.z:.2f})"
+                if why:
                     s["active"].remove(arm)
                     s["dropped"].append(arm)
                     events.append({"kind": "futility_stop", "dim": d, "arm": arm, "seg": "ALL",
-                                   "evidence": c.as_dict(),
-                                   "summary": f"{d}={arm}: {c.n_arm} calls, 95% CI upper {c.ci(1.96)[1] - 1:+.1%} "
-                                              f"< +{MIN_LIFT:.0%} -> stop exploring"})
+                                   "evidence": c.as_dict(), "summary": f"{d}={arm}: {why} -> stop exploring"})
 
     for fam, alpha in (("ALL", ALPHA_ALL), ("SEG", ALPHA_SEG)):
         hs = [h for h in hyp if h[0] == fam]

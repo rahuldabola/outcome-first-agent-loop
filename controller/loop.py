@@ -514,8 +514,8 @@ class Controller:
         what = self._what(inc["kind"], det, inc["bad"])
         pid = self.request(wid, w, "incident", new, urgent=True,
                            summary=f"Switch script {inc['bad']} -> {cand}: {what}",
-                           rationale=f"Incident opened {(self.now - inc['opened']) / 60:.1f} h ago: {what} "
-                                     f"(population test p={det.get('p_value', 0):.1e}). Candidate {cand} chosen from "
+                           rationale=f"Incident opened {(self.now - inc['opened']) / 60:.1f} h ago: {what}. "
+                                     f"Candidate {cand} chosen from "
                                      f"{source}; validation {val['validation_run_id']} pass rate {val['pass_rate']:.3f} "
                                      f"on n={val['n']}. If {inc['bad']} was a supervisor edit, this reverts it -- "
                                      f"with your approval only. After apply we verify the flag rate returns to normal.",
