@@ -1,0 +1,4 @@
+{
+  "_comment": "Per-tenant preferences from stakeholder memos. They can only make us stricter than the workflow's governance policy, never looser.",
+  "kestrel_finance": {"earliest_request_hour": 11, "max_requests_per_day": 2}
+}
