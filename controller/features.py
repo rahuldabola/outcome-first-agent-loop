@@ -136,7 +136,7 @@ def quantize(dist: dict, q: int = 1024) -> dict:
     raw = {k: v / tot * q for k, v in dist.items() if v > 0}
     base = {k: int(v) for k, v in raw.items()}
     rem = q - sum(base.values())
-    for k in sorted(raw, key=lambda k: -(raw[k] - base[k]))[:rem]:
+    for k in sorted(raw, key=lambda k: (-(raw[k] - base[k]), k))[:rem]:  # deterministic ties
         base[k] += 1
     return {k: v / q for k, v in base.items() if v > 0}
 

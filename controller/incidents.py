@@ -102,7 +102,7 @@ def known_good(w, today: int, totals: dict, exclude: set[str], history: list[dic
         if p and p in ok and p not in exclude and p not in seen:
             out.append(p)
             seen.add(p)
-    for p in sorted(ok - seen - exclude, key=lambda p: -totals[p]["eng_rate"]):
+    for p in sorted(ok - seen - exclude, key=lambda p: (-totals[p]["eng_rate"], p)):
         out.append(p)
     return out
 

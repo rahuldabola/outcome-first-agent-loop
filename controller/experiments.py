@@ -36,6 +36,7 @@ FUTILITY_N = 2500
 PROMO_WINDOW_DAYS = 4
 DECAY_WINDOW_DAYS = 2
 MAX_SEG_RULES_PER_DIM = 3
+SUPERVISOR_PENALTY = 10
 
 
 def init_state(w, config: dict) -> dict:
@@ -164,7 +165,12 @@ def look(w, st: dict, today: int, minute: int, decay_only: bool = False) -> list
         hs = [h for h in hyp if h[0] == fam]
         if not hs:
             continue
-        acc = stats.holm([h[4].p_better for h in hs], alpha)
+        # Overriding a supervisor's explicit choice needs 10x stronger evidence: their pick is a prior,
+        # and being wrong against it costs trust, not just engagement. (Implemented by inflating the
+        # p-value fed to Holm, which keeps the family-wise guarantee intact.)
+        pv = [min(1.0, h[4].p_better * (SUPERVISOR_PENALTY if st[h[1]].get("frozen_by_supervisor") is not None else 1))
+              for h in hs]
+        acc = stats.holm(pv, alpha)
         for ok, (_, d, arm, seg, c) in sorted(zip(acc, hs), key=lambda t: -t[1][4].log_rr):
             if not ok or c.rr < 1 + MIN_LIFT:
                 continue

@@ -66,7 +66,8 @@ def rss_mb() -> float:
 class Controller:
     def __init__(self, url: str, db: str, step: int = 60, prefs: str | None = None, stop_at: int | None = None):
         self.sim = Sim(url)
-        self.st = Store(db)
+        self.db = db
+        self.st = None
         self.step = step
         self.stop_at = stop_at  # for crash tests: exit (as if killed) once sim minute >= stop_at
         p = Path(prefs) if prefs else Path(__file__).with_name("prefs.json")
@@ -79,10 +80,23 @@ class Controller:
         self.sim.wait_ready()
         state = self.sim.get("/sim/state")
         self.specs = {w["workflow_id"]: w for w in self.sim.get("/workflows")}
+        path = Path(self.db if self.db != "auto" else f"state/{state['scenario']}.db")
+        self.st = Store(path)
+        # A store belongs to exactly one simulated world. If the simulator is behind what we have seen
+        # (it restarted = a new world) or runs another scenario, archive the old store and start clean.
+        # If it is at/after our last minute, this is a controller restart: resume.
+        seen_scn, seen_min = self.st.get("scenario"), self.st.get("last_minute")
+        new_world = (seen_scn is not None and seen_scn != state["scenario"]) or \
+            (seen_min is not None and state["sim_minute"] < seen_min)
+        if new_world:
+            self.st.db.close()
+            for suf in ("", "-wal", "-shm"):
+                if Path(str(path) + suf).exists():
+                    os.replace(str(path) + suf, f"{path}.old-{int(time.time())}{suf}")
+            log.warning("store %s belonged to another world (%s @ %s); archived, starting fresh", path, seen_scn,
+                        seen_min)
+            self.st = Store(path)
         with self.st.tx():
-            if self.st.get("scenario") not in (None, state["scenario"]):
-                raise SystemExit(f"store {self.st.path} belongs to scenario {self.st.get('scenario')}, "
-                                 f"simulator runs {state['scenario']}: use a fresh --db")
             self.st.put("scenario", state["scenario"])
             self.st.put("specs", self.specs)
             self.ing = Ingestor(self.st, self.specs)
@@ -259,15 +273,17 @@ class Controller:
         before = {d: s["status"] for d, s in did.get("status", {}).items()}
         health = callerid.assess(w, self.now, did, cur)
         tgt = callerid.target(health, cur)
-        bad_live = [d for d, h in health.items() if h["status"] in ("flagged", "poor") and cur.get(d, 0) > 0]
+        bad_live = [d for d, h in health.items() if h["status"] in callerid.BAD and cur.get(d, 0) > 0]
         with self.st.tx():
             for d, h in health.items():
                 if before.get(d) != h["status"]:
                     sev = "page" if h["status"] == "flagged" else "info"
+                    sd = did.get("status", {}).get(d, {})
+                    bad = h["status"] in callerid.BAD
+                    r_, z_ = (sd.get("ratio"), sd.get("z")) if bad else (h.get("ratio"), h.get("z"))
                     self.st.decide(self.now, wid, "caller_id_status",
                                    f"caller ID {d}: {before.get(d, 'new')} -> {h['status']}"
-                                   + (f" (pickup ratio {h.get('ratio')} vs other numbers, z={h.get('z')})"
-                                      if "ratio" in h else ""), h)
+                                   + (f" (pickup {r_}x the other numbers, z={z_})" if r_ is not None else ""), h)
                     if h["status"] == "flagged":
                         self.st.alert(self.now, wid, sev, f"did_flagged_{d}",
                                       f"caller ID {d} pickup at {h.get('ratio')}x of other numbers: likely "
@@ -306,7 +322,8 @@ class Controller:
                         self.st.alert(self.now, wid, "ticket", "auto_scope",
                                       f"caller-ID auto-apply would also change {dims}; skipped")
                 return
-            why = (f"caller ID {', '.join(bad_live)} degraded -> rotate out" if bad_live
+            why = (f"caller ID {', '.join(bad_live)} {'/'.join(sorted({health[d]['status'] for d in bad_live}))} "
+                   f"-> rotate out" if bad_live
                    else "rebalance caller IDs toward an even split over healthy numbers (+5% probes for unproven)")
             body = {"proposal_id": self.gov.next_id(wid, "did", self.now), "base_version": cfg["version"],
                     "proposed_config": new,
@@ -723,6 +740,7 @@ class Controller:
              "last_event_id": state["last_event_id"], "events_total": self.ing.events_total}
         with self.st.tx():
             self.st.x("INSERT OR REPLACE INTO metrics(minute, data) VALUES (?,?)", (self.now, dumps(m)))
+            self.st.put("last_minute", self.now)
             if self.ing.events_total < state["last_event_id"]:
                 self.st.alert(self.now, None, "page", "ingest_behind",
                               f"ingested {self.ing.events_total} < produced {state['last_event_id']}")

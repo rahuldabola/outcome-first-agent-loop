@@ -10,6 +10,8 @@ Status per DID (with hysteresis -- a number never flips back and forth on noise)
   flagged   pickup < 0.70x the other numbers with z <= -4 over the last 6 dialling hours
             (looks spam-flagged) -> removed at once, alert raised.
   poor      a probe that came back < 0.85x the others (z <= -2) -> not adopted.
+  overloaded same collapse, but the number was never seen healthy (it carried most of the volume):
+            removed, rested 48 h, then re-probed at 5%.
   flagged/poor are sticky: never re-probed automatically (a human clears them after carrier
             remediation). Healthy numbers that fall idle for 48 h become 'unknown' again.
 
@@ -32,6 +34,7 @@ REST_MINUTES = 48 * 60
 MIN_TV_CHANGE = 0.05
 SHRINK_DIALS = 1500
 POWER = 3.0
+BAD = ("flagged", "poor", "overloaded")   # never routed to while in these states
 
 
 def recent(w, minute: int, n_hours: int) -> np.ndarray | None:
@@ -84,8 +87,14 @@ def assess(w, minute: int, state: dict, cur_dist: dict) -> dict:
         if c12 is not None:
             info.update(ratio=round(c12.rr, 3), z=round(c12.z, 2))
             info["health"] = round(1 + (c12.rr - 1) * n12 / (n12 + SHRINK_DIALS), 4)
-        if c6 is not None and c6.rr < 0.70 and c6.z <= -4 and st["status"] not in ("flagged", "poor"):
-            st.update(status="flagged", since=minute, ratio=round(c6.rr, 3), z=round(c6.z, 2))
+        if c12 is not None and c12.rr >= 0.85:
+            st["ever_ok"] = True
+        if c6 is not None and c6.rr < 0.70 and c6.z <= -4 and st["status"] not in BAD:
+            # A *step change* on a number we have seen healthy looks like a carrier spam flag (sticky).
+            # A number that was already this far behind at its first comparison was simply carrying
+            # too much volume (e.g. 100% of history on one number): rest it, then re-probe.
+            new = "flagged" if st.get("ever_ok") else "overloaded"
+            st.update(status=new, since=minute, ratio=round(c6.rr, 3), z=round(c6.z, 2))
         if st["status"] in ("unknown", "resting") and _recent_dials(w, minute, i) >= MIN_DIALS_KNOWN \
                 and c12 is not None:
             if c12.rr < 0.85 and c12.z <= -2:
@@ -95,12 +104,12 @@ def assess(w, minute: int, state: dict, cur_dist: dict) -> dict:
         if st["status"] == "healthy" and cur_dist.get(d, 0) == 0 and _recent_dials(w, minute, i) == 0 \
                 and minute - st["since"] > REST_MINUTES:
             st.update(status="unknown", since=minute)   # unused for long: we no longer know it
+        if st["status"] == "overloaded" and cur_dist.get(d, 0) == 0 and minute - st["since"] >= REST_MINUTES:
+            st.update(status="resting", since=minute)
         # 'poor' and 'flagged' are sticky. A probe runs at 5% of traffic, i.e. at negligible load, so a
-        # number that answers poorly *while probed* is poor in itself, not overloaded; re-probing it
-        # would only spend customers. A human clears either state (see RUNBOOK.md).
-        # 'flagged' is sticky: carrier spam labels rarely clear on their own, and every probe call
-        # on a flagged number is a customer who sees "Spam likely". A human clears it after the
-        # carrier remediation (see RUNBOOK.md).
+        # number that answers poorly *while probed* is poor in itself; and carrier spam labels rarely
+        # clear on their own -- every probe call on a flagged number is a customer who sees "Spam
+        # likely". A human clears either state after carrier remediation (see RUNBOOK.md).
         info["status"] = st["status"]
         out[d] = info
     return out
@@ -108,7 +117,7 @@ def assess(w, minute: int, state: dict, cur_dist: dict) -> dict:
 
 def target(health: dict, cur: dict, max_probes: int = 1) -> dict:
     """Desired allocation. Never routes to a flagged/poor number; probes <= max_probes at 5% each."""
-    bad = ("flagged", "poor")
+    bad = BAD
     healthy = [d for d, h in health.items() if h["status"] == "healthy"]
     if not healthy:
         healthy = [d for d in cur if health.get(d, {}).get("status") not in bad + ("unknown", "resting")] or \
@@ -132,7 +141,7 @@ def target(health: dict, cur: dict, max_probes: int = 1) -> dict:
 def worth_it(cur: dict, new: dict, health: dict) -> bool:
     """Change caller IDs only for a reason: a flagged/poor number is live, the set of numbers in use
     changes (probe starts/ends), or the estimated pickup gain is >= 1%."""
-    if any(health.get(d, {}).get("status") in ("flagged", "poor") for d, v in cur.items() if v > 0):
+    if any(health.get(d, {}).get("status") in BAD for d, v in cur.items() if v > 0):
         return True
     used_cur = {d for d, v in cur.items() if v > 0}
     used_new = {d for d, v in new.items() if v > 0}
@@ -153,7 +162,7 @@ def expected_effect(cur: dict, new: dict, health: dict) -> float:
 
 def tv(a: dict, b: dict) -> float:
     sa, sb = sum(a.values()) or 1, sum(b.values()) or 1
-    keys = set(a) | set(b)
+    keys = sorted(set(a) | set(b))
     return 0.5 * sum(abs(a.get(k, 0) / sa - b.get(k, 0) / sb) for k in keys)
 
 
@@ -165,7 +174,7 @@ def step_toward(cur: dict, tgt: dict, max_shift: float) -> dict:
     if d <= max_shift + 1e-9:
         return dict(tgt)
     f = (max_shift - 1e-3) / d
-    keys = set(c) | set(tgt)
+    keys = sorted(set(c) | set(tgt))
     out = {k: c.get(k, 0) + f * (tgt.get(k, 0) - c.get(k, 0)) for k in keys}
     out = quantize({k: v for k, v in out.items() if v > 1e-6})
     if tv(c, out) > max_shift:   # quantisation can add up to ~1/1024 per option
